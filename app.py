@@ -7,7 +7,7 @@ import io
 from fpdf import FPDF
 from datetime import datetime
 
-# --- CONFIGURAÇÃO DE SEGURANÇA ---
+# --- SEGURANÇA ---
 SENHA_ACESSO = "MD2026"
 
 def check_password():
@@ -15,13 +15,12 @@ def check_password():
         st.session_state["auth"] = False
     if not st.session_state["auth"]:
         st.title("🏛️ Acesso Restrito - Fair Value")
-        senha = st.text_input("Digite a senha do escritório:", type="password")
-        if st.button("Acessar Sistema"):
+        senha = st.text_input("Senha do escritório:", type="password")
+        if st.button("Entrar"):
             if senha == SENHA_ACESSO:
                 st.session_state["auth"] = True
                 st.rerun()
-            else:
-                st.error("Senha incorreta!")
+            else: st.error("Incorreta!")
         return False
     return True
 
@@ -34,11 +33,8 @@ def extrair_dados_especificos(f_binario):
         nf_m = re.search(r"Número da NFS-e\s*(\d+)", texto_limpo)
         if nf_m: info["NF"] = nf_m.group(1)
         
-        termo_data = "Data e Hora da emissão da NFS-e"
-        if termo_data in texto_limpo:
-            pos_data = texto_limpo.find(termo_data) + len(termo_data)
-            data_m = re.search(r"(\d{2}/\d{2}/\d{4})", texto_limpo[pos_data:])
-            if data_m: info["Data"] = data_m.group(1)
+        data_m = re.search(r"(\d{2}/\d{2}/\d{4})", texto_limpo)
+        if data_m: info["Data"] = data_m.group(1)
             
         if "Descrição do Serviço" in texto_limpo:
             inicio = texto_limpo.find("Descrição do Serviço") + len("Descrição do Serviço")
@@ -51,17 +47,6 @@ def extrair_dados_especificos(f_binario):
         return info
     except: return None
 
-def sugerir_nome(desc):
-    # REGRA MELHORADA: Busca o nome completo após DR., DRA. ou DO(A)
-    match = re.search(r"(?:DRA?\.|PARA\s+|PELO\s+|PELA\s+|AO\s+)([A-ZÀ-Ú\s]{3,30})", desc.upper())
-    if match:
-        nome = match.group(1).strip()
-        # Limpa palavras que não fazem parte do nome
-        for lixo in [" REFERENTE", " NO ", " PERÍODO", " COMPETÊNCIA", " VALOR", " CPF"]:
-            if lixo in nome: nome = nome.split(lixo)[0]
-        return nome.strip()
-    return ""
-
 def fmt(v): return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 if check_password():
@@ -69,38 +54,65 @@ if check_password():
     st.title("🏛️ Fair Value - Rateio DAS")
     
     c1, c2 = st.columns(2)
-    with c1: arq_das_in = st.file_uploader("1. Guia DAS (PDF)", type=["pdf"])
+    with c1: arq_das_in = st.file_uploader("1. Guia DAS", type=["pdf"])
     with c2: arqs_nfs_in = st.file_uploader("2. Notas Fiscais", type=["zip", "pdf"], accept_multiple_files=True)
 
     if arq_das_in and arqs_nfs_in:
-        nfs_finais = []
+        nfs_lidas = []
         for item in arqs_nfs_in:
             if item.name.lower().endswith('.zip'):
                 with zipfile.ZipFile(item) as z:
                     for nome_f in z.namelist():
                         if nome_f.lower().endswith('.pdf'):
                             with z.open(nome_f) as f:
-                                nfs_finais.append(extrair_dados_especificos(io.BytesIO(f.read())))
+                                nfs_lidas.append(extrair_dados_especificos(io.BytesIO(f.read())))
             else:
-                nfs_finais.append(extrair_dados_especificos(item))
+                nfs_lidas.append(extrair_dados_especificos(item))
 
-        nfs_finais = [n for n in nfs_finais if n is not None]
-        nfs_finais.sort(key=lambda x: datetime.strptime(x['Data'], '%d/%m/%Y'))
+        nfs_lidas = [n for n in nfs_lidas if n is not None]
+        nfs_lidas.sort(key=lambda x: datetime.strptime(x['Data'], '%d/%m/%Y'))
         
-        txt_das = extract_text(arq_das_in)
-        m_das = re.search(r"Valor Total do Documento\s*([\d.,]+)", txt_das)
-        total_das = float(m_das.group(1).replace(".", "").replace(",", ".")) if m_das else 0.0
+        try:
+            txt_das = extract_text(arq_das_in)
+            m_das = re.search(r"Valor Total do Documento\s*([\d.,]+)", txt_das)
+            total_das = float(m_das.group(1).replace(".", "").replace(",", "."))
+        except: total_das = 0.0
+
+        st.subheader("⚙️ Configuração dos Prestadores")
+        st.write("Digite o nome ou parte da descrição para identificar cada sócio/prestador.")
+        
+        # --- AQUI VOLTA A LÓGICA DA VARIÁVEL ---
+        num_prestadores = st.number_input("Quantos prestadores neste rateio?", min_value=1, value=2)
+        filtros = []
+        cols_p = st.columns(num_prestadores)
+        for idx in range(num_prestadores):
+            with cols_p[idx]:
+                nome_p = st.text_input(f"Nome do Sócio {idx+1}", placeholder="Ex: DANIELA", key=f"nome_{idx}")
+                busca_p = st.text_input(f"Variável de busca {idx+1}", placeholder="Ex: DANIELA ou 123.456", key=f"busca_{idx}")
+                filtros.append({"nome": nome_p.upper(), "busca": busca_p.upper()})
 
         st.markdown("---")
         validado = []
-        for i, nota in enumerate(nfs_finais):
-            sugestao = sugerir_nome(nota["Desc"])
+        st.subheader("🔍 Conferência das Notas Encontradas")
+        
+        for i, nota in enumerate(nfs_lidas):
+            # Identifica o prestador com base na variável de busca
+            prestador_identificado = "NÃO IDENTIFICADO"
+            for f in filtros:
+                if f["busca"] and f["busca"] in nota["Desc"].upper():
+                    prestador_identificado = f["nome"]
+                    break
+            
             col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
             col1.info(f"{nota['Data']}")
             col2.write(f"NF: {nota['NF'][-5:]}")
             col3.write(f"{fmt(nota['V'])}")
-            nome = col4.text_input(f"Confirmar Prestador", value=sugestao, key=f"v9_{i}")
-            validado.append({"P": nome.upper(), "V": nota["V"], "NF": nota["NF"], "Data": nota["Data"]})
+            nome_final = col4.text_input(f"Confirmar para:", value=prestador_identificado, key=f"conf_{i}")
+            
+            with st.expander(f"Ver descrição da NF {nota['NF']}"):
+                st.write(nota["Desc"])
+                
+            validado.append({"P": nome_final.upper(), "V": nota["V"], "NF": nota["NF"], "Data": nota["Data"]})
 
         if st.button("📊 GERAR PDF FINAL"):
             df = pd.DataFrame(validado)
@@ -115,7 +127,7 @@ if check_password():
             pdf.ln(5)
             
             # Tabela de Rateio
-            pdf.set_fill_color(200, 200, 200)
+            pdf.set_fill_color(230, 230, 230)
             pdf.set_font("Arial", 'B', 10)
             pdf.cell(80, 10, " PRESTADOR", 1, 0, 'L', True)
             pdf.cell(55, 10, " FATURAMENTO", 1, 0, 'C', True)
@@ -132,4 +144,4 @@ if check_password():
             pdf.cell(55, 10, f" {fmt(total_f)}", 1, 0, 'C', True)
             pdf.cell(55, 10, f" {fmt(total_das)}", 1, 1, 'C', True)
 
-            st.download_button("📥 BAIXAR RELATÓRIO PRONTO", pdf.output(dest='S').encode('latin-1'), "Rateio_Final_FairValue.pdf")
+            st.download_button("📥 BAIXAR RELATÓRIO PRONTO", pdf.output(dest='S').encode('latin-1'), "Rateio_Final.pdf")
